@@ -1,4 +1,17 @@
 #!/usr/bin/env python
+"""
+HAPI-RECAP: Reconstruct Parent Genomes from Sibling IBD and HAPI2 Phasing.
+
+This module combines phased haplotypes from HAPI2 with IBD segments to
+reconstruct parental DNA when parent genotypes are unavailable or incomplete.
+It identifies which phased haplotypes belong to which parent using IBD overlap
+patterns with relatives, and infers parent sexes using sex-specific genetic maps
+and detected crossover events.
+
+References:
+    Qiao Y, et al. "Reconstructing parent genomes using siblings and other
+    relatives." bioRxiv (2024). https://doi.org/10.1101/2024.05.10.593578
+"""
 
 import argparse
 import itertools
@@ -15,7 +28,54 @@ import piso
 from pysam import VariantFile, VariantHeader
 
 
+REQUIRED_HAPI_KEYS = {"marker", "physpos", "chr", "chrstr"}
+
+
+def _require_columns(df, required_columns, label):
+    """Validate that a DataFrame contains required columns."""
+    missing = [column for column in required_columns if column not in df.columns]
+    if missing:
+        raise KeyError(f"{label} is missing required columns: {', '.join(missing)}")
+
+
+def _get_relative_ibd_groups(parent_ibd, chrom):
+    """Return IBD segments on one chromosome grouped by relative id."""
+    rel_ibd_chrom = parent_ibd[parent_ibd.chromosome == chrom]
+    if len(rel_ibd_chrom.index) == 0:
+        return {}
+    return {
+        rel_id: rel_df.reset_index(drop=True)
+        for rel_id, rel_df in rel_ibd_chrom.groupby("id2", sort=False)
+    }
+
+
+def _annotate_overlap_coordinates(overlap_df, p_seg_start, p_seg_end, chrom, genetic_map):
+    """Attach clipped overlap coordinates and genetic positions."""
+    overlap_rel_ibd = overlap_df.copy()
+    overlap_rel_ibd["relative_start"] = overlap_rel_ibd["start"].clip(lower=p_seg_start)
+    overlap_rel_ibd["relative_end"] = overlap_rel_ibd["end"].clip(upper=p_seg_end)
+    overlap_rel_ibd["rel_start_cm"] = [genetic_map[chrom][index] for index in overlap_rel_ibd["relative_start"]]
+    overlap_rel_ibd["rel_end_cm"] = [genetic_map[chrom][index] for index in overlap_rel_ibd["relative_end"]]
+    return overlap_rel_ibd
+
+
 def parse_args():
+    """
+    Parse command-line arguments for HAPI-RECAP.
+
+    Returns
+    -------
+    argparse.Namespace
+        Parsed arguments with the following attributes:
+        - inf_hapi_json (str): Path to JSON file output by HAPI2
+        - ibd_feather (str): Path pattern to IBD Feather files
+        - bim (str): Path to PLINK BIM file
+        - sex_avg_map (str): Path to sex-averaged genetic map
+        - male_map (str): Path to male-specific genetic map
+        - female_map (str): Path to female-specific genetic map
+        - co_dir (str): Directory containing HAPI2 crossover files
+        - out (str): Output directory for VCF files
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "-inf_hapi_json",
@@ -71,6 +131,32 @@ def parse_args():
 
 
 def merge_ibd(segments, genetic_map):
+    """
+    Merge overlapping IBD segments for each (id1, id2, chromosome) group.
+
+    Uses interval union operations to combine overlapping IBD segments within
+    each group, updating both SNP-based and genetic map-based coordinates.
+    Adapted from 23andMe's RACMACHINE GitHub repository.
+
+    Parameters
+    ----------
+    segments : pandas.DataFrame
+        IBD segments with columns: id1, id2, chromosome, start, end, start_cm, end_cm
+        where start/end are SNP indices and start_cm/end_cm are genetic positions.
+    genetic_map : dict
+        Dictionary mapping chromosome IDs to lists of genetic positions (cM).
+
+    Returns
+    -------
+    pandas.DataFrame
+        Merged IBD segments with same structure as input, grouped by
+        (id1, id2, chromosome) and sorted accordingly.
+
+    Notes
+    -----
+    Handles corner cases where SNP-based and genetic map-based coordinate
+    counts may differ due to rounding.
+    """
     # code adapted from https://github.com/23andme-private/racmachine/blob/348a856f4baa638cefdbdee9bacc08f506644aa6/racmachine/phasedibd/ibd.py#L227-L271
     def _merge_groupby_segments(groupby_df, genetic_map, chrom):
         interval_arr_snps = pd.arrays.IntervalArray.from_arrays(
@@ -94,7 +180,7 @@ def merge_ibd(segments, genetic_map):
 
     groupby_vars = ["id1", "id2", "chromosome"]
     merged_dfs = []
-    for groupby_values, groupby_df in segments.groupby(groupby_vars):
+    for groupby_values, groupby_df in segments.groupby(groupby_vars, sort=False):
         df = _merge_groupby_segments(groupby_df, genetic_map, groupby_values[2])  # 2 is index of "chromosome" in groupby element
         for var, value in zip(groupby_vars, groupby_values):
             df[var] = value
@@ -106,6 +192,30 @@ def merge_ibd(segments, genetic_map):
 
 
 def filter_overlap_ibd(segments, genetic_map):
+    """
+    Filter IBD segments to remove overlaps between different parents for same relative.
+
+    For relatives (id2) with IBD to multiple parent IDs (id1), removes overlapping
+    regions so that segments are non-overlapping. Keeps non-overlapping segments intact.
+    Adapted from 23andMe's RACMACHINE GitHub repository.
+
+    Parameters
+    ----------
+    segments : pandas.DataFrame
+        IBD segments with columns: id1, id2, chromosome, start, end, start_cm, end_cm.
+    genetic_map : dict
+        Dictionary mapping chromosome IDs to lists of genetic positions (cM).
+
+    Returns
+    -------
+    pandas.DataFrame
+        Filtered IBD segments with overlaps removed, grouped by (id2, chromosome).
+
+    Notes
+    -----
+    Uses interval difference operations to remove overlapping regions.
+    Handles corner cases with rounding differences between coordinates.
+    """
     # code adapted from https://github.com/23andme-private/racmachine/blob/348a856f4baa638cefdbdee9bacc08f506644aa6/racmachine/phasedibd/ibd.py#L227-L271
     def _filter_groupby_segments(groupby_df, genetic_map, chrom):
         interval_arrs_snps = []
@@ -148,7 +258,7 @@ def filter_overlap_ibd(segments, genetic_map):
 
     groupby_vars = ["id2", "chromosome"]
     filtered_dfs = []
-    for groupby_values, groupby_df in segments.groupby(groupby_vars):
+    for groupby_values, groupby_df in segments.groupby(groupby_vars, sort=False):
         if len(groupby_df.id1.unique()) > 1:
             df = _filter_groupby_segments(groupby_df, genetic_map, groupby_values[1])  # 1 is index of "chromosome" groupby element
             if len(df.index) == 0:
@@ -164,9 +274,32 @@ def filter_overlap_ibd(segments, genetic_map):
     return filtered_ibd
 
 
-# Find the start and end positions of regions HAPI2 believes it phased into two
-# distinct parents
 def extract_parent_segments(parents, inf_hapi_data):
+    """
+    Extract genomic segments where HAPI2 phased two distinct parents.
+
+    Identifies regions between P (phased parent) and other code sites where
+    HAPI2 determined distinct parental haplotypes. Segments must span at least
+    100 markers to be included.
+
+    Parameters
+    ----------
+    parents : str
+        Parent identifiers in format 'id1-id2'.
+    inf_hapi_data : dict
+        HAPI2 output dictionary containing 'codes', 'chr', 'chrstr', and other metadata.
+
+    Returns
+    -------
+    dict
+        Dictionary keyed by chromosome, with values as lists of [start, end] positions
+        for each parent segment in marker coordinates (relative to chromosome start).
+
+    Notes
+    -----
+    P sites indicate phase boundaries. Segments occur between P sites or at
+    chromosome boundaries. Only segments with >= 100 markers are retained.
+    """
     the_parent_segments = defaultdict(list)
 
     prev_chrom = None
@@ -216,15 +349,42 @@ def extract_parent_segments(parents, inf_hapi_data):
 
 
 def find_purple(close_rels, parent_ibd, parent_segments, genetic_map):
+    """
+    Identify "purple" relatives with IBD to both parents.
+
+    Purple relatives show evidence of being related to both parents, which may
+    indicate parental relationships or misphasing. Relatives are considered purple
+    if more than 10% of their IBD overlaps with parent segments from both parents.
+
+    Parameters
+    ----------
+    close_rels : pandas.DataFrame
+        Relatives with total IBD > 600 cM, indexed by relative ID.
+    parent_ibd : pandas.DataFrame
+        IBD segments for the parent pair with relatives.
+    parent_segments : dict
+        Parent segments keyed by chromosome with [start, end] positions.
+    genetic_map : dict
+        Dictionary mapping chromosome IDs to genetic positions (cM).
+
+    Returns
+    -------
+    set
+        Set of relative IDs identified as purple (related to both parents).
+
+    Notes
+    -----
+    Filters overlaps by requiring > 6 cM of genetic distance to be counted.
+    Logs information for each relative about purple overlap counts.
+    """
     purple_rels = set()
     for rel_id in close_rels.index:
         num_purple_overlap = 0
         num_overlap = 0
         for chrom, chr_parent_segments in parent_segments.items():
-            rel_ibd_chrom = parent_ibd[
-                (parent_ibd.id2 == rel_id) &
-                (parent_ibd.chromosome == chrom)
-            ]
+            rel_ibd_chrom = _get_relative_ibd_groups(parent_ibd, chrom).get(rel_id)
+            if rel_ibd_chrom is None:
+                continue
             for p_seg in chr_parent_segments:
                 p_seg_start = p_seg[0]
                 p_seg_end = p_seg[1]
@@ -232,24 +392,11 @@ def find_purple(close_rels, parent_ibd, parent_segments, genetic_map):
                 overlap_rel_ibd = rel_ibd_chrom[
                     (rel_ibd_chrom.start < p_seg_end) &
                     (rel_ibd_chrom.end > p_seg_start)
-                ].reset_index(drop=True).copy()
+                ].reset_index(drop=True)
                 if len(overlap_rel_ibd.index) == 0:
                     continue
 
-                overlap_rel_ibd["relative_start"] = pd.concat(
-                    [
-                        pd.Series([p_seg_start] * len(overlap_rel_ibd.index)),
-                        overlap_rel_ibd.start
-                    ], axis=1
-                ).max(axis=1)
-                overlap_rel_ibd["relative_end"] = pd.concat(
-                    [
-                        pd.Series([p_seg_end] * len(overlap_rel_ibd.index)),
-                        overlap_rel_ibd.end
-                    ], axis=1
-                ).min(axis=1)
-                overlap_rel_ibd["rel_start_cm"] = [genetic_map[chrom][index] for index in overlap_rel_ibd["relative_start"]]
-                overlap_rel_ibd["rel_end_cm"] = [genetic_map[chrom][index] for index in overlap_rel_ibd["relative_end"]]
+                overlap_rel_ibd = _annotate_overlap_coordinates(overlap_rel_ibd, p_seg_start, p_seg_end, chrom, genetic_map)
                 # TODO: could tune this -- what fraction of the parent segments does it overlap, e.g.?
                 overlap_rel_ibd = overlap_rel_ibd[
                     overlap_rel_ibd.rel_end_cm - overlap_rel_ibd.rel_start_cm > 6
@@ -262,6 +409,8 @@ def find_purple(close_rels, parent_ibd, parent_segments, genetic_map):
                         num_purple_overlap += 1
 
         logging.info(f"  {rel_id} has {num_purple_overlap} purple overlaps of {num_overlap} overlapping IBD segments")
+        if num_overlap == 0:
+            continue
         if num_purple_overlap / num_overlap > .10:
             purple_rels.add(rel_id)
 
@@ -269,6 +418,38 @@ def find_purple(close_rels, parent_ibd, parent_segments, genetic_map):
 
 
 def calc_co_probs(chrom, the_cos, p_seg_start, p_seg_end, ss_genetic_map):
+    """
+    Calculate crossover log-LOD scores for parent sex inference.
+
+    Computes Poisson log-likelihood (base 10) for observing observed crossovers
+    under male vs. female-specific genetic maps. Used to infer parent sexes.
+
+    Parameters
+    ----------
+    chrom : str or int
+        Chromosome identifier.
+    the_cos : list of dict
+        Two dictionaries containing crossover positions for each parent.
+        Each dict maps chromosome to list of (marker_up, marker_down) tuples.
+    p_seg_start : int
+        Start position of parent segment in marker coordinates.
+    p_seg_end : int
+        End position of parent segment in marker coordinates.
+    ss_genetic_map : list of dict
+        Two genetic maps (male, female) mapping chromosome to genetic positions.
+
+    Returns
+    -------
+    list of float
+        Two-element list of LOD scores:
+        - Index 0: Log-likelihood if parent 0 is male and parent 1 is female
+        - Index 1: Log-likelihood if parent 0 is female and parent 1 is male
+
+    Notes
+    -----
+    Only crossovers spanning <= 45 markers and falling within the segment are counted.
+    Uses Poisson distribution with expected rate based on genetic map distance.
+    """
     # probabilities that:
     # index 0: parent 0 is male and 1 female (default)
     # index 1: parent 0 is female and 1 male (swapped)
@@ -304,6 +485,40 @@ def calc_co_probs(chrom, the_cos, p_seg_start, p_seg_end, ss_genetic_map):
 
 
 def collect_update_segment_overlaps(the_parent_segments, rels_to_analyze, parent_ibd, genetic_map, father):
+    """
+    Link parent segments to relatives and count co-inheritance patterns.
+
+    For each parent segment, determines which relatives share IBD with it and
+    counts how many segments relative pairs share with the same parent vs.
+    opposite parents. Also calculates total overlap length per relative.
+
+    Parameters
+    ----------
+    the_parent_segments : dict
+        Parent segments keyed by chromosome with [start, end] positions.
+        Modified in-place to append relative_parent_linkage information.
+    rels_to_analyze : set
+        Set of relative IDs to analyze (excludes purple relatives).
+    parent_ibd : pandas.DataFrame
+        IBD segments for parent pair with relatives.
+    genetic_map : dict
+        Dictionary mapping chromosome IDs to genetic positions (cM).
+    father : int
+        Integer ID of the father.
+
+    Returns
+    -------
+    tuple
+        - rel_pairs_side_counts (dict): Maps frozenset of relative pairs to
+          [count_same_parent, count_opposite_parent]
+        - rel_overlap_length (dict): Maps relative ID to total overlap length in cM
+
+    Notes
+    -----
+    Updates the_parent_segments in-place by appending relative_parent_linkage
+    dictionaries (or None for purple segments).
+    Segments marked purple (overlapping both parents) are skipped.
+    """
     # indexed on a frozenset of two relative ids, each element is a 2-length list of counts
     # of how many parent segments the two relatives share IBD with the same parent vs opposite
     # parents
@@ -312,6 +527,7 @@ def collect_update_segment_overlaps(the_parent_segments, rels_to_analyze, parent
     rel_overlap_length = defaultdict(lambda: 0)
 
     for chrom, chr_parent_segments in the_parent_segments.items():
+        rel_ibd_by_id = _get_relative_ibd_groups(parent_ibd, chrom)
         # Below, we will append a dict to this_parent_segments containing the parent each relative has an IBD segment to
         for this_parent_seg in chr_parent_segments:
             [p_seg_start, p_seg_end] = this_parent_seg
@@ -321,30 +537,18 @@ def collect_update_segment_overlaps(the_parent_segments, rels_to_analyze, parent
             segment_is_purple = False
 
             for rel_id in rels_to_analyze:
-                overlap_rel_ibd = parent_ibd[
-                    (parent_ibd.id2 == rel_id) &
-                    (parent_ibd.chromosome == chrom) &
-                    (parent_ibd.start < p_seg_end) &
-                    (parent_ibd.end > p_seg_start)
-                ].reset_index(drop=True).copy()
+                rel_ibd_chrom = rel_ibd_by_id.get(rel_id)
+                if rel_ibd_chrom is None:
+                    continue
+                overlap_rel_ibd = rel_ibd_chrom[
+                    (rel_ibd_chrom.start < p_seg_end) &
+                    (rel_ibd_chrom.end > p_seg_start)
+                ].reset_index(drop=True)
                 if len(overlap_rel_ibd.index) == 0:
                     # No IBD segment overlap
                     continue
 
-                overlap_rel_ibd["relative_start"] = pd.concat(
-                    [
-                        pd.Series([p_seg_start] * len(overlap_rel_ibd.index)),
-                        overlap_rel_ibd.start
-                    ], axis=1
-                ).max(axis=1)
-                overlap_rel_ibd["relative_end"] = pd.concat(
-                    [
-                        pd.Series([p_seg_end] * len(overlap_rel_ibd.index)),
-                        overlap_rel_ibd.end
-                    ], axis=1
-                ).min(axis=1)
-                overlap_rel_ibd["rel_start_cm"] = [genetic_map[chrom][index] for index in overlap_rel_ibd["relative_start"]]
-                overlap_rel_ibd["rel_end_cm"] = [genetic_map[chrom][index] for index in overlap_rel_ibd["relative_end"]]
+                overlap_rel_ibd = _annotate_overlap_coordinates(overlap_rel_ibd, p_seg_start, p_seg_end, chrom, genetic_map)
                 # TODO: could tune this -- what fraction of the parent segments does it overlap, e.g.?
                 overlap_rel_ibd = overlap_rel_ibd[
                     overlap_rel_ibd.rel_end_cm - overlap_rel_ibd.rel_start_cm > 6
@@ -387,8 +591,37 @@ def collect_update_segment_overlaps(the_parent_segments, rels_to_analyze, parent
 
 
 def determine_overlap_rel_parent_orient(rels_to_analyze, rel_overlap_length, rel_pairs_side_counts):
+    """
+    Determine parent orientation based on relative IBD co-inheritance patterns.
+
+    Identifies which relatives are informative for parent assignment by selecting
+    the relative with maximum overlap length and finding best secondary relative
+    based on co-inheritance scores.
+
+    Parameters
+    ----------
+    rels_to_analyze : set
+        Set of relative IDs to analyze.
+    rel_overlap_length : dict
+        Maps relative ID to total overlap length in cM.
+    rel_pairs_side_counts : dict
+        Maps frozenset of relative pairs to [count_same, count_opposite].
+
+    Returns
+    -------
+    dict
+        Maps relative ID to orientation (0 or 1) indicating which parent they
+        are primarily linked to.
+
+    Notes
+    -----
+    Selects maximum overlap relative as anchor (always orientation 0).
+    Secondary relative selected based on co-inheritance score:
+    score = max(same, opposite) - 3*min(same, opposite)
+    Skips pairs with min(same, opposite) > 2 (too ambiguous).
+    """
     overlap_rel_parent_orient = dict()
-    if len(rels_to_analyze) > 0:
+    if len(rels_to_analyze) > 0 and len(rel_overlap_length) > 0:
         max_overlap_rel = max(rel_overlap_length, key=rel_overlap_length.get)
         overlap_rel_parent_orient[max_overlap_rel] = 0
 
@@ -416,6 +649,37 @@ def determine_overlap_rel_parent_orient(rels_to_analyze, rel_overlap_length, rel
 
 
 def link_segs_parents(the_parent_segments, overlap_rel_parent_orient, the_cos, ss_genetic_map):
+    """
+    Link parent segments to specific parents based on IBD and crossover evidence.
+
+    For each parent segment, determines which parent (0 or 1) it belongs to by
+    combining IBD linkage information with crossover probability scores. Segments
+    without IBD linkage are marked with None parent_idx but still assigned CO scores.
+
+    Parameters
+    ----------
+    the_parent_segments : dict
+        Modified parent segments containing relative_parent_linkage info.
+        Keyed by chromosome with values [start, end, relative_parent_linkage].
+    overlap_rel_parent_orient : dict
+        Maps relative ID to parent orientation (0 or 1).
+    the_cos : list of dict
+        Two dictionaries with crossover positions per parent per chromosome.
+    ss_genetic_map : list of dict
+        Two sexual-specific genetic maps (male index 0, female index 1).
+
+    Returns
+    -------
+    dict
+        Dictionary keyed by chromosome with values as lists of tuples:
+        (p_seg_start, p_seg_end, parent_idx, co_probs)
+        where parent_idx is 0/1 if IBD-linked or None if not.
+
+    Notes
+    -----
+    parent_idx values: 0 indicates one parent, 1 the other, None if unlinked.
+    All segments include crossover probability scores for later sex inference.
+    """
     # dictionary keyed on chromosome that stores a list of tupes;
     # each tuple stores information about the parent segments as:
     #   (p_seg_start, p_seg_end, parent_idx, co_probs)
@@ -464,10 +728,43 @@ def link_segs_parents(the_parent_segments, overlap_rel_parent_orient, the_cos, s
     return parent_segs_linkage
 
 
-# this_parent_orient is 0 or 1: 0 means that parent 0 is the father, parent 1 is the mother; 1 is the reverse
 def print_segment(inf_hapi_data, parents, snp_to_alleles, this_parent_orient,
                   chrom, p_seg_start, p_seg_end, num_data_sites, vcf_out):
+    """
+    Write reconstructed parent genotypes for a chromosomal segment to VCF.
 
+    Extracts inferred parent haplotypes from HAPI2 output for a segment,
+    orients them according to determined parent sexes, and writes VCF records.
+    Handles missing and half-missing sites appropriately.
+
+    Parameters
+    ----------
+    inf_hapi_data : dict
+        HAPI2 output JSON data with phased haplotypes and metadata.
+    parents : str
+        Parent identifier string (format 'id1-id2').
+    snp_to_alleles : dict
+        Maps SNP IDs to (ref, alt) allele tuples.
+    this_parent_orient : int
+        0 if parent 0 is father (parent 1 is mother), 1 if reversed.
+    chrom : str or int
+        Chromosome identifier.
+    p_seg_start : int
+        Segment start position (marker index relative to chromosome).
+    p_seg_end : int
+        Segment end position (marker index relative to chromosome).
+    num_data_sites : list of list
+        Modified in-place: counts of [full, half, missing] sites for each parent.
+    vcf_out : pysam.VariantFile
+        Open VCF file for writing records.
+
+    Notes
+    -----
+    HAPI2 error codes (E, R, ?) result in missing parent genotypes.
+    Half-missing sites (one allele is 0) are coded as homozygous for known allele.
+    this_parent_orient=0: parent 0 is father, parent 1 is mother
+    this_parent_orient=1: parent 0 is mother, parent 1 is father (reversed)
+    """
     inf_parent_haps = inf_hapi_data[parents]["parhaps"]
     inf_codes = inf_hapi_data[parents]["codes"]
     chr_start_marker_idx = inf_hapi_data["chrstr"][chrom]
@@ -520,6 +817,44 @@ def print_segment(inf_hapi_data, parents, snp_to_alleles, this_parent_orient,
 
 def reconstruct(parents, inf_hapi_data, snp_to_alleles, ibd, genetic_map, ss_genetic_map,
                 chrom_names, args):
+    """
+    Main reconstruction pipeline for a parent pair.
+
+    Orchestrates the full pipeline: filters IBD segments, identifies close relatives,
+    detects purple relatives, determines parent orientations using IBD and crossovers,
+    links segments to parents, infers parent sexes, and outputs VCF with reconstructed
+    genotypes and reconstruction statistics.
+
+    Parameters
+    ----------
+    parents : str
+        Parent identifier string (format 'father_id-mother_id').
+    inf_hapi_data : dict
+        HAPI2 output JSON containing phased haplotypes and metadata.
+    snp_to_alleles : dict
+        Maps SNP IDs to (ref, alt) allele tuples.
+    ibd : pandas.DataFrame
+        IBD segments for all relative pairs.
+    genetic_map : dict
+        Sex-averaged genetic map (chromosome -> genetic positions).
+    ss_genetic_map : list of dict
+        Sex-specific genetic maps [male_map, female_map].
+    chrom_names : list
+        List of chromosome identifiers in order.
+    args : argparse.Namespace
+        Command-line arguments containing output directory and crossover directory.
+
+    Returns
+    -------
+    None
+        Outputs VCF file to args.out/[parents].vcf and logs statistics.
+
+    Notes
+    -----
+    Parent segments are classified by IBD linkage evidence vs. crossover-only evidence.
+    Reconstructed segments output with estimated fraction of parent genomes recovered.
+    Statistics distinguish fully reconstructed (both alleles) vs. half-reconstructed sites.
+    """
     logging.info(f"Analayzing parents {parents}")
 
     # TODO: document assumption re: '-' in parent ids
@@ -539,7 +874,7 @@ def reconstruct(parents, inf_hapi_data, snp_to_alleles, ibd, genetic_map, ss_gen
     parent_ibd = parent_ibd[parent_ibd.length_cm > 9]
     close_rels = (
         parent_ibd
-        .groupby(["id2"])[["length_cm"]]
+        .groupby(["id2"], sort=False)[["length_cm"]]
         .sum()
         .sort_values(by=["length_cm"], ascending=False)
     )
@@ -672,6 +1007,22 @@ def reconstruct(parents, inf_hapi_data, snp_to_alleles, ibd, genetic_map, ss_gen
 
 
 def main():
+    """
+    Main entry point for HAPI-RECAP.
+
+    Loads all required input files (HAPI2 JSON, IBD segments, genetic maps),
+    processes each parent pair, and outputs reconstructed VCF files.
+
+    Returns
+    -------
+    None
+        Exits with code 2 on error creating output directory, otherwise exits 0.
+
+    Raises
+    ------
+    SystemExit
+        If output directory cannot be created.
+    """
     args = parse_args()
 
     # if necessary, create output directory
@@ -685,6 +1036,9 @@ def main():
     logging.info("Loading inferred json")
     with open(args.inf_hapi_json) as fin:
         inf_hapi_data = json.load(fin)
+    missing_hapi_keys = REQUIRED_HAPI_KEYS - set(inf_hapi_data)
+    if missing_hapi_keys:
+        raise KeyError(f"HAPI2 JSON is missing required keys: {', '.join(sorted(missing_hapi_keys))}")
 
     logging.info("Loading alleles from bim file")
     snp_to_alleles = dict()
@@ -716,7 +1070,17 @@ def main():
     ibd_by_chrom = []
     for chrom in range(1, 23):
         filename = args.ibd_feather.replace("chr1", f"chr{chrom}")
-        ibd_by_chrom.append(pd.read_feather(filename))
+        if not Path(filename).exists():
+            raise FileNotFoundError(f"Missing IBD feather file: {filename}")
+        chrom_ibd = pd.read_feather(filename)
+        _require_columns(
+            chrom_ibd,
+            ["id1", "id2", "chromosome", "start", "end", "start_cm", "end_cm"],
+            f"IBD feather file {filename}",
+        )
+        ibd_by_chrom.append(chrom_ibd)
+    if not ibd_by_chrom:
+        raise ValueError("No IBD feather files were loaded")
     ibd = pd.concat(ibd_by_chrom, ignore_index=True)
 
     chrom_names = [k for k, v in sorted(inf_hapi_data["chrstr"].items(), key=lambda item: item[1])]
