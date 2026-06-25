@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 import piso
 try:
-    from pysam import VariantFile, VariantHeader
+    from pysam import VariantFile, VariantHeader # type: ignore
     HAS_PYSAM = True
 except ModuleNotFoundError:
     VariantFile = None
@@ -236,9 +236,104 @@ def parse_args():
         ),
         action="store_true",
     )
+    parser.add_argument(
+        "-emit_sibling_rp_list",
+        help=(
+            "if set, emit per-sibling recombination-point lists parsed from HAPI co-* files "
+            "for each chromosome (comparison-friendly with visual phasing)."
+        ),
+        action="store_true",
+    )
 
     args = parser.parse_args()
     return args
+
+
+def write_sibling_rp_list(parents, co_file_parents, co_dir, inf_hapi_data, out_dir):
+    """Write sibling recombination-point list parsed from HAPI crossover files."""
+    file_safe_parents = parents.replace(":", "-")
+    out_path = Path(out_dir) / f"{file_safe_parents}.sibling_rp_list.tsv"
+
+    # Map chromosome -> global marker index interval for bounds checking.
+    chrom_names = [
+        chrom for chrom, _ in sorted(inf_hapi_data["chrstr"].items(), key=lambda item: item[1])
+    ]
+    chrom_global_bounds = {}
+    for idx, chrom in enumerate(chrom_names):
+        start = int(inf_hapi_data["chrstr"][chrom])
+        if idx + 1 < len(chrom_names):
+            end = int(inf_hapi_data["chrstr"][chrom_names[idx + 1]]) - 1
+        else:
+            end = len(inf_hapi_data["chr"]) - 1
+        chrom_global_bounds[str(chrom)] = (start, end)
+
+    rows = []
+    for chrom in range(1, 23):
+        co_filename = f"{co_dir}/co-{parents}.{chrom}"
+        if not Path(co_filename).exists():
+            co_filename = f"{co_dir}/co-{co_file_parents}.{chrom}"
+        if not Path(co_filename).exists():
+            continue
+
+        chrom_key = str(chrom)
+        if chrom_key not in chrom_global_bounds:
+            continue
+        chrom_global_start, chrom_global_end = chrom_global_bounds[chrom_key]
+
+        with open(co_filename, "r", encoding="utf-8", errors="ignore") as fin:
+            for line in fin:
+                if not line or line[0] == "#":
+                    continue
+                fields = line.strip().split()
+                # Expected format:
+                # CO: parent_id parent_sex num_child recipient_id chrom
+                #     marker_num_before marker_id_before marker_num_after marker_id_after
+                if len(fields) < 10:
+                    continue
+                if fields[0] != "CO:":
+                    continue
+
+                sibling_id = fields[4]
+                co_chrom = fields[5]
+                if co_chrom != chrom_key:
+                    continue
+
+                marker_before = int(fields[6])
+                marker_after = int(fields[8])
+
+                # Convert chromosome-relative marker indexes to global indexes.
+                global_before = chrom_global_start + marker_before
+                global_after = chrom_global_start + marker_after
+                global_before = min(max(global_before, chrom_global_start), chrom_global_end)
+                global_after = min(max(global_after, chrom_global_start), chrom_global_end)
+
+                bp_before = int(inf_hapi_data["physpos"][global_before])
+                bp_after = int(inf_hapi_data["physpos"][global_after])
+
+                rows.append(
+                    {
+                        "chromosome": int(chrom),
+                        "sibling_id": sibling_id,
+                        "parent_id": fields[1],
+                        "parent_sex_code": int(fields[2]),
+                        "marker_before": marker_before,
+                        "marker_after": marker_after,
+                        "marker_span": marker_after - marker_before,
+                        "bp_before": bp_before,
+                        "bp_after": bp_after,
+                        "bp_span": bp_after - bp_before,
+                        "source_file": Path(co_filename).name,
+                    }
+                )
+
+    if not rows:
+        logging.info("No sibling RPs written; no crossover records found in %s", co_dir)
+        return
+
+    rp_df = pd.DataFrame(rows)
+    rp_df = rp_df.sort_values(["chromosome", "sibling_id", "marker_before"]).reset_index(drop=True)
+    rp_df.to_csv(out_path, sep="\t", index=False)
+    logging.info("Wrote sibling RP list: %s", out_path)
 
 
 def merge_ibd(segments, genetic_map):
@@ -1278,13 +1373,13 @@ def reconstruct(parents, inf_hapi_data, snp_to_alleles, ibd, genetic_map, ss_gen
 
     if HAS_PYSAM:
         # setup header
-        header = VariantHeader()
+        header = VariantHeader() # type: ignore
         for chrom in chrom_names:
             header.contigs.add(chrom)
         header.formats.add("GT", 1, "String", "Genotype")
         for parent_id in (father, mother):
             header.add_sample(str(parent_id))
-        vcf_handle = VariantFile(f"{args.out}/{file_safe_parents}.vcf", mode="w", header=header)
+        vcf_handle = VariantFile(f"{args.out}/{file_safe_parents}.vcf", mode="w", header=header) # type: ignore
     else:
         vcf_handle = open(f"{args.out}/{file_safe_parents}.vcf", "w", encoding="utf-8")
         vcf_handle.write("##fileformat=VCFv4.2\n")
@@ -1364,10 +1459,13 @@ def reconstruct(parents, inf_hapi_data, snp_to_alleles, ibd, genetic_map, ss_gen
     if args.emit_input_format_csv:
         write_parent_csv_outputs((father, mother), parent_csv_records, args.out)
 
+    if args.emit_sibling_rp_list:
+        write_sibling_rp_list(parents, co_file_parents, args.co_dir, inf_hapi_data, args.out)
+
     # quantify reconstruction
     num_ibd_reconstructed = [0, 0]
     num_co_reconstructed = [0, 0]
-    frac = [0, 0]
+    frac = [0., 0.]
     for parent_idx in range(2):
         num_ibd_reconstructed[parent_idx] = num_ibd_data_sites[parent_idx][1] +\
                                         2 * num_ibd_data_sites[parent_idx][2]
