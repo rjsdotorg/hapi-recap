@@ -22,6 +22,7 @@ For bp mode, provide both:
 from __future__ import annotations
 
 import argparse
+import re
 from collections import defaultdict
 from pathlib import Path
 
@@ -29,6 +30,28 @@ import numpy as np
 import pandas as pd
 
 REQUIRED_OUTPUT_COLUMNS = ["id1", "id2", "chromosome", "start", "end", "start_cm", "end_cm"]
+
+
+def _normalize_sample_id(sample_id: str, id_style: str) -> str:
+    """Normalize sample IDs to match HAPI keys or legacy dash format."""
+    sid = str(sample_id)
+    if id_style == "keep":
+        return sid
+    fam_dash = re.fullmatch(r"([^:\s]+)-(\d+)", sid)
+    fam_colon = re.fullmatch(r"([^:\s]+):(\d+)", sid)
+    if id_style == "hapi":
+        if fam_colon:
+            return sid
+        if fam_dash:
+            return f"{fam_dash.group(1)}:{fam_dash.group(2)}"
+        return sid
+    if id_style == "legacy":
+        if fam_dash:
+            return sid
+        if fam_colon:
+            return f"{fam_colon.group(1)}-{fam_colon.group(2)}"
+        return sid
+    return sid
 
 
 def _normalize_chrom(value: object) -> str | None:
@@ -153,6 +176,15 @@ def main() -> None:
 
     parser.add_argument("--id1-col", default="id1")
     parser.add_argument("--id2-col", default="id2")
+    parser.add_argument(
+        "--id-style",
+        choices=["hapi", "legacy", "keep"],
+        default="hapi",
+        help=(
+            "Sample ID output style for feather id1/id2. "
+            "'hapi' uses FAM:ID (default), 'legacy' uses FAM-ID, 'keep' leaves values unchanged."
+        ),
+    )
     parser.add_argument("--chrom-col", default="chromosome")
     parser.add_argument("--start-col", default="start")
     parser.add_argument("--end-col", default="end")
@@ -195,6 +227,8 @@ def main() -> None:
     work = pd.DataFrame()
     work["id1"] = segments[args.id1_col].astype("string")
     work["id2"] = segments[args.id2_col].astype("string")
+    work["id1"] = work["id1"].map(lambda x: _normalize_sample_id(x, args.id_style)).astype("string")
+    work["id2"] = work["id2"].map(lambda x: _normalize_sample_id(x, args.id_style)).astype("string")
     work["chromosome"] = segments[args.chrom_col].map(_normalize_chrom).astype("string")
 
     # Keep autosomes only for this pipeline.

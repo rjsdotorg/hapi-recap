@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 from collections import defaultdict
 from pathlib import Path
 
@@ -23,6 +24,29 @@ import numpy as np
 import pandas as pd
 
 OUTPUT_COLUMNS = ["id1", "id2", "chromosome", "start", "end", "start_cm", "end_cm"]
+
+
+def _normalize_sample_id(sample_id: str, id_style: str) -> str:
+    """Normalize sample IDs to match HAPI keys or legacy dash format."""
+    sid = str(sample_id)
+    if id_style == "keep":
+        return sid
+    # Convert only family-style IDs like FAM1-100001 / FAM1:100001.
+    fam_dash = re.fullmatch(r"([^:\s]+)-(\d+)", sid)
+    fam_colon = re.fullmatch(r"([^:\s]+):(\d+)", sid)
+    if id_style == "hapi":
+        if fam_colon:
+            return sid
+        if fam_dash:
+            return f"{fam_dash.group(1)}:{fam_dash.group(2)}"
+        return sid
+    if id_style == "legacy":
+        if fam_dash:
+            return sid
+        if fam_colon:
+            return f"{fam_colon.group(1)}-{fam_colon.group(2)}"
+        return sid
+    return sid
 
 
 def _pick_column(columns, aliases):
@@ -519,6 +543,15 @@ def main() -> None:
     parser.add_argument("--siblings", required=True, help="Comma-separated sibling IDs")
     parser.add_argument("--cousins", required=True, help="Comma-separated cousin IDs")
     parser.add_argument("--id1", required=True, help="Parent ID to assign as id1 for all cousin segments")
+    parser.add_argument(
+        "--id-style",
+        choices=["hapi", "legacy", "keep"],
+        default="hapi",
+        help=(
+            "Sample ID output style for feather id1/id2. "
+            "'hapi' uses FAM:ID (default), 'legacy' uses FAM-ID, 'keep' leaves values unchanged."
+        ),
+    )
 
     parser.add_argument("--min-map", required=True, help="Visual Phaser min_map.txt path")
     parser.add_argument("--bim", required=True, help="BIM file used for HAPI2")
@@ -658,8 +691,8 @@ def main() -> None:
 
             out_rows.append(
                 {
-                    "id1": str(row["id1"]),
-                    "id2": str(row["id2"]),
+                    "id1": _normalize_sample_id(str(row["id1"]), args.id_style),
+                    "id2": _normalize_sample_id(str(row["id2"]), args.id_style),
                     "chromosome": chrom_str,
                     "start": int(start_idx),
                     "end": int(end_idx),

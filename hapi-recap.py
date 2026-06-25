@@ -81,6 +81,19 @@ def _resolve_genetic_map_key(genetic_map, chrom):
     return None
 
 
+def _parent_id_aliases(parent_id):
+    """Return common ID aliases used across HAPI and feather outputs."""
+    pid = str(parent_id)
+    aliases = {pid}
+    # Keep last token (e.g., "100001")
+    aliases.add(pid.split(":")[-1])
+    aliases.add(pid.split("-")[-1])
+    # Family+id variants used in this pipeline
+    aliases.add(pid.replace(":", "-"))
+    aliases.add(pid.replace("-", ":"))
+    return {a for a in aliases if a}
+
+
 def _annotate_overlap_coordinates(overlap_df, p_seg_start, p_seg_end, chrom, genetic_map):
     """Attach clipped overlap coordinates and genetic positions."""
     overlap_rel_ibd = overlap_df.copy()
@@ -89,6 +102,39 @@ def _annotate_overlap_coordinates(overlap_df, p_seg_start, p_seg_end, chrom, gen
     overlap_rel_ibd["rel_start_cm"] = [_get_genetic_cm(genetic_map, chrom, index) for index in overlap_rel_ibd["relative_start"]]
     overlap_rel_ibd["rel_end_cm"] = [_get_genetic_cm(genetic_map, chrom, index) for index in overlap_rel_ibd["relative_end"]]
     return overlap_rel_ibd
+
+
+def _resolve_overlap_parent(overlap_rel_ibd, dominance_ratio=1.5):
+    """Resolve overlap parent from id1 evidence with ambiguity handling.
+
+    Returns (resolved_parent_id, is_ambiguous). If multiple parents overlap and
+    neither dominates by the specified ratio, the overlap is treated as
+    ambiguous.
+    """
+    unique_parents = overlap_rel_ibd.id1.unique().tolist()
+    if len(unique_parents) == 0:
+        return None, True
+    if len(unique_parents) == 1:
+        return unique_parents[0], False
+
+    parent_overlap_cm = (
+        overlap_rel_ibd
+        .assign(overlap_cm=overlap_rel_ibd.rel_end_cm - overlap_rel_ibd.rel_start_cm)
+        .groupby("id1", sort=False)["overlap_cm"]
+        .sum()
+        .sort_values(ascending=False)
+    )
+    if len(parent_overlap_cm.index) < 2:
+        return parent_overlap_cm.index[0], False
+
+    top_parent = parent_overlap_cm.index[0]
+    top_cm = float(parent_overlap_cm.iloc[0])
+    next_cm = float(parent_overlap_cm.iloc[1])
+    if next_cm <= 0:
+        return top_parent, False
+    if top_cm >= dominance_ratio * next_cm:
+        return top_parent, False
+    return None, True
 
 
 def _get_genetic_cm(genetic_map, chrom, index):
@@ -654,14 +700,22 @@ def find_purple(close_rels, parent_ibd, parent_segments, genetic_map):
                 if len(overlap_rel_ibd.index) > 0:
                     # have >= 1 overlapping segment
                     num_overlap += 1
-                    if len(overlap_rel_ibd.id1.unique()) > 1:
-                        # purple overlap
+                    _, is_ambiguous = _resolve_overlap_parent(overlap_rel_ibd)
+                    if is_ambiguous:
                         num_purple_overlap += 1
 
-        logging.info(f"  {rel_id} has {num_purple_overlap} purple overlaps of {num_overlap} overlapping IBD segments")
+        purple_ratio = (num_purple_overlap / num_overlap) if num_overlap > 0 else 0.0
+        logging.info(
+            "  %s has %d ambiguous overlaps of %d overlapping IBD segments (ratio=%.3f)",
+            rel_id,
+            num_purple_overlap,
+            num_overlap,
+            purple_ratio,
+        )
         if num_overlap == 0:
             continue
-        if num_purple_overlap / num_overlap > .10:
+        # Require pervasive ambiguity before excluding a relative as purple.
+        if num_overlap >= 20 and purple_ratio > 0.75:
             purple_rels.add(rel_id)
 
     return purple_rels
@@ -784,8 +838,6 @@ def collect_update_segment_overlaps(the_parent_segments, rels_to_analyze, parent
             relative_parent_linkage = dict()
 
             parent_rels = [set(), set()]  # relatives connected to parent 0/1
-            segment_is_purple = False
-
             for rel_id in rels_to_analyze:
                 rel_ibd_chrom = rel_ibd_by_id.get(rel_id)
                 if rel_ibd_chrom is None:
@@ -805,19 +857,12 @@ def collect_update_segment_overlaps(the_parent_segments, rels_to_analyze, parent
                 ]
                 if len(overlap_rel_ibd.index) == 0:
                     continue
-                if len(overlap_rel_ibd.id1.unique()) > 1:
-                    # purple overlap: skip
-                    segment_is_purple = True
-                    break
-
-                overlap_parent = overlap_rel_ibd.id1.iloc[0]
+                overlap_parent, is_ambiguous = _resolve_overlap_parent(overlap_rel_ibd)
+                if is_ambiguous or overlap_parent is None:
+                    continue
                 parent_idx = 0 if overlap_parent == father else 1
                 parent_rels[parent_idx].add(rel_id)
                 relative_parent_linkage[rel_id] = parent_idx
-
-            if segment_is_purple:
-                this_parent_seg.append(None)
-                continue
             this_parent_seg.append(relative_parent_linkage)
 
             # pairs with IBD to the same parent:
@@ -1231,8 +1276,8 @@ def reconstruct(parents, inf_hapi_data, snp_to_alleles, ibd, genetic_map, ss_gen
             co_file_parents = f"{father_family}-{father_id}-{mother_family}-{mother_id}"
     else:
         co_file_parents = file_safe_parents
-    father_keys = {father, father.split(':')[-1]}
-    mother_keys = {mother, mother.split(':')[-1]}
+    father_keys = _parent_id_aliases(father)
+    mother_keys = _parent_id_aliases(mother)
     parent_keys = father_keys | mother_keys
 
     # because the parent haplotype assignments can be swapped, IBD to
@@ -1240,23 +1285,71 @@ def reconstruct(parents, inf_hapi_data, snp_to_alleles, ibd, genetic_map, ss_gen
     id1_str = ibd["id1"].astype(str)
     id2_str = ibd["id2"].astype(str)
     parent_ibd = ibd[id1_str.isin(parent_keys)]
+    if len(parent_ibd.index) == 0:
+        logging.warning(
+            "No parent-linked IBD rows found (id1 does not contain %s/%s). "
+            "This usually means a sibling-cousin feather set was provided (for example, ibd_with_cousins) "
+            "instead of parent-vs-relative feathers. Parent-specific maternal/paternal assignment will be unavailable.",
+            father,
+            mother,
+        )
     # remove segments between the parents
     parent_ibd_id2_str = parent_ibd["id2"].astype(str)
     parent_ibd = parent_ibd[~parent_ibd_id2_str.isin(parent_keys)]
+
+    # Canonicalize parent labels so downstream comparisons are not sensitive to
+    # dash/colon formatting differences between HAPI JSON and feather files.
+    def _canonicalize_parent_id(parent_id):
+        pid = str(parent_id)
+        if pid in father_keys:
+            return father
+        if pid in mother_keys:
+            return mother
+        return pid
+
+    parent_ibd = parent_ibd.copy()
+    parent_ibd["id1"] = parent_ibd["id1"].astype(str).map(_canonicalize_parent_id)
     # TODO: combine merge_ibd() with filter_overlap_ibd()
-    parent_ibd = merge_ibd(parent_ibd, genetic_map)
+    parent_ibd_merged = merge_ibd(parent_ibd, genetic_map)
     # filter segments that overlap both parents
-    parent_ibd = filter_overlap_ibd(parent_ibd, genetic_map)
-    parent_ibd = parent_ibd.astype({"start": int, "end": int})
-    parent_ibd["length_cm"] = parent_ibd["end_cm"] - parent_ibd["start_cm"]
-    parent_ibd = parent_ibd[parent_ibd.length_cm > 9]
-    close_rels = (
-        parent_ibd
-        .groupby(["id2"], sort=False)[["length_cm"]]
-        .sum()
-        .sort_values(by=["length_cm"], ascending=False)
+    parent_ibd_overlap_filtered = filter_overlap_ibd(parent_ibd_merged, genetic_map)
+
+    def _finalize_parent_ibd_and_close_rels(parent_ibd_df):
+        parent_ibd_df = parent_ibd_df.astype({"start": int, "end": int}).copy()
+        parent_ibd_df["length_cm"] = parent_ibd_df["end_cm"] - parent_ibd_df["start_cm"]
+        parent_ibd_df = parent_ibd_df[parent_ibd_df.length_cm > 9]
+        close_rel_df = (
+            parent_ibd_df
+            .groupby(["id2"], sort=False)[["length_cm"]]
+            .sum()
+            .sort_values(by=["length_cm"], ascending=False)
+        )
+        close_rel_df = close_rel_df[close_rel_df.length_cm > 600]
+        return parent_ibd_df, close_rel_df
+
+    parent_ibd, close_rels = _finalize_parent_ibd_and_close_rels(parent_ibd_overlap_filtered)
+    parent_ibd_merged_gt9, close_rels_merged = _finalize_parent_ibd_and_close_rels(parent_ibd_merged)
+
+    logging.info(
+        "  Parent-relative IBD rows >9 cM: merged=%d, overlap-filtered=%d",
+        len(parent_ibd_merged_gt9.index),
+        len(parent_ibd.index),
     )
-    close_rels = close_rels[close_rels.length_cm > 600]
+    logging.info(
+        "  Close relatives (>600 cM): merged=%d, overlap-filtered=%d",
+        len(close_rels_merged.index),
+        len(close_rels.index),
+    )
+
+    if len(close_rels.index) == 0 and len(close_rels_merged.index) > 0:
+        logging.warning(
+            "  Overlap filtering removed all close relatives (%d rows >9 cM after filter vs %d before); "
+            "falling back to merged parent IBD without overlap subtraction.",
+            len(parent_ibd.index),
+            len(parent_ibd_merged_gt9.index),
+        )
+        parent_ibd = parent_ibd_merged_gt9
+        close_rels = close_rels_merged
 
     no_close_rels = len(close_rels.index) == 0
     co_lod_threshold = 3.0
