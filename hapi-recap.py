@@ -14,6 +14,7 @@ References:
 """
 
 import argparse
+import csv
 import itertools
 import json
 import logging
@@ -25,7 +26,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import piso
-from pysam import VariantFile, VariantHeader
+try:
+    from pysam import VariantFile, VariantHeader
+    HAS_PYSAM = True
+except ModuleNotFoundError:
+    VariantFile = None
+    VariantHeader = None
+    HAS_PYSAM = False
 
 
 REQUIRED_HAPI_KEYS = {"marker", "physpos", "chr", "chrstr"}
@@ -49,14 +56,58 @@ def _get_relative_ibd_groups(parent_ibd, chrom):
     }
 
 
+def _normalize_map_keys(genetic_map_like):
+    """Ensure chromosome X and 23 can be used interchangeably as map keys."""
+    if "23" in genetic_map_like and "X" not in genetic_map_like:
+        genetic_map_like["X"] = genetic_map_like["23"]
+    if "X" in genetic_map_like and "23" not in genetic_map_like:
+        genetic_map_like["23"] = genetic_map_like["X"]
+    return genetic_map_like
+
+
+def _resolve_genetic_map_key(genetic_map, chrom):
+    chrom_key = str(chrom)
+    alias_map = {
+        "X": "23",
+        "23": "X",
+        "Y": "24",
+        "24": "Y",
+    }
+    if chrom_key in genetic_map and len(genetic_map[chrom_key]) > 0:
+        return chrom_key
+    alias_key = alias_map.get(chrom_key)
+    if alias_key in genetic_map and len(genetic_map[alias_key]) > 0:
+        return alias_key
+    return None
+
+
 def _annotate_overlap_coordinates(overlap_df, p_seg_start, p_seg_end, chrom, genetic_map):
     """Attach clipped overlap coordinates and genetic positions."""
     overlap_rel_ibd = overlap_df.copy()
     overlap_rel_ibd["relative_start"] = overlap_rel_ibd["start"].clip(lower=p_seg_start)
     overlap_rel_ibd["relative_end"] = overlap_rel_ibd["end"].clip(upper=p_seg_end)
-    overlap_rel_ibd["rel_start_cm"] = [genetic_map[chrom][index] for index in overlap_rel_ibd["relative_start"]]
-    overlap_rel_ibd["rel_end_cm"] = [genetic_map[chrom][index] for index in overlap_rel_ibd["relative_end"]]
+    overlap_rel_ibd["rel_start_cm"] = [_get_genetic_cm(genetic_map, chrom, index) for index in overlap_rel_ibd["relative_start"]]
+    overlap_rel_ibd["rel_end_cm"] = [_get_genetic_cm(genetic_map, chrom, index) for index in overlap_rel_ibd["relative_end"]]
     return overlap_rel_ibd
+
+
+def _get_genetic_cm(genetic_map, chrom, index):
+    """Safely fetch genetic position for a chromosome marker index.
+
+    HAPI parent-segment end coordinates are inclusive marker indexes and can land
+    on or just beyond the last valid map entry for a chromosome. Clamp into the
+    valid range so downstream cM calculations stay defined.
+    """
+    chrom_key = _resolve_genetic_map_key(genetic_map, chrom)
+    if chrom_key is None:
+        raise IndexError(f"Genetic map for chromosome {chrom} is empty")
+    cmap = genetic_map[chrom_key]
+    idx = int(index)
+    if idx < 0:
+        idx = 0
+    elif idx >= len(cmap):
+        idx = len(cmap) - 1
+    return cmap[idx]
 
 
 def parse_args():
@@ -125,6 +176,66 @@ def parse_args():
         type=str,
         required=True,
     )
+    parser.add_argument(
+        "-use_default_no_relatives",
+        help=(
+            "if set, keep default crossover LOD threshold behavior when no close relatives "
+            "are available; by default HAPI-RECAP is slightly more lenient in that case"
+        ),
+        action="store_true",
+    )
+    parser.add_argument(
+        "-no_relatives_lod_threshold",
+        help=(
+            "crossover-only absolute LOD threshold to use when no close relatives are found "
+            "(ignored if -use_default_no_relatives is set)"
+        ),
+        type=float,
+        default=2.5,
+    )
+    parser.add_argument(
+        "-sibling_only_mode",
+        help=(
+            "enable 3-sibling-only reconstruction: when no close relatives are found, "
+            "allow CO-only segment assignment even if sex-LOD is uninformative"
+        ),
+        action="store_true",
+    )
+    parser.add_argument(
+        "-emit_input_format_csv",
+        help=(
+            "also emit one reconstructed parent CSV per parent in input-style format "
+            "with columns: rsid,chromosome,position,result"
+        ),
+        action="store_true",
+    )
+    parser.add_argument(
+        "-min_parent_segment_markers",
+        help=(
+            "minimum marker span for extracted HAPI parent segments; default 800 "
+            "(use smaller values such as 500 only for permissive/debug exploration)"
+        ),
+        type=int,
+        default=800,
+    )
+    parser.add_argument(
+        "-dump_parent_segments",
+        help=(
+            "if set, write extracted parent-segment candidates (including dropped short spans) "
+            "to parent_segments_debug.tsv in the output directory"
+        ),
+        action="store_true",
+    )
+    parser.add_argument(
+        "-pa_sites_break_segments",
+        help=(
+            "if set, treat PA (phase-ambiguous) codes as hard segment boundaries, matching "
+            "the original HAPI-RECAP behaviour. By default PA codes are ignored for segment "
+            "breaking because they represent HAPI sampling anchors in low-information regions, "
+            "not genuine crossovers, and splitting on them creates spurious micro-fragments."
+        ),
+        action="store_true",
+    )
 
     args = parser.parse_args()
     return args
@@ -173,8 +284,8 @@ def merge_ibd(segments, genetic_map):
         end_cm = [intv.right for intv in merged_interval_arr_cms]
         if len(start) != len(start_cm):
             # corner case: because of rounding, can get fewer start/end cMs than SNPs
-            start_cm = [genetic_map[chrom][s] for s in start]
-            end_cm = [genetic_map[chrom][e] for e in end]
+            start_cm = [_get_genetic_cm(genetic_map, chrom, s) for s in start]
+            end_cm = [_get_genetic_cm(genetic_map, chrom, e) for e in end]
         df = pd.DataFrame({"start": start, "end": end, "start_cm": start_cm, "end_cm": end_cm})
         return df
 
@@ -185,6 +296,8 @@ def merge_ibd(segments, genetic_map):
         for var, value in zip(groupby_vars, groupby_values):
             df[var] = value
         merged_dfs.append(df)
+    if not merged_dfs:
+        return pd.DataFrame(columns=["id1", "id2", "chromosome", "start", "end", "start_cm", "end_cm"])
     merged_ibd = pd.concat(merged_dfs, ignore_index=True)
     new_cols = groupby_vars + [col for col in merged_ibd.columns if col not in groupby_vars]
     merged_ibd = merged_ibd[new_cols]
@@ -249,8 +362,8 @@ def filter_overlap_ibd(segments, genetic_map):
             end_cm = [intv.right for intv in subtracted_interval_arr_cms]
             if len(start) != len(start_cm):
                 # corner case: because of rounding, can get fewer start/end cMs than SNPs
-                start_cm = [genetic_map[chrom][s] for s in start]
-                end_cm = [genetic_map[chrom][e] for e in end]
+                start_cm = [_get_genetic_cm(genetic_map, chrom, s) for s in start]
+                end_cm = [_get_genetic_cm(genetic_map, chrom, e) for e in end]
             df = pd.DataFrame({"start": start, "end": end, "start_cm": start_cm, "end_cm": end_cm})
             df["id1"] = parent_id
             dfs.append(df)
@@ -268,19 +381,27 @@ def filter_overlap_ibd(segments, genetic_map):
             filtered_dfs.append(df)
         else:
             filtered_dfs.append(groupby_df)
+    if not filtered_dfs:
+        return pd.DataFrame(columns=segments.columns)
     filtered_ibd = pd.concat(filtered_dfs, ignore_index=True)
     #new_cols = groupby_vars + [col for col in merged_ibd.columns if col not in groupby_vars]
     #merged_ibd = merged_ibd[new_cols]
     return filtered_ibd
 
 
-def extract_parent_segments(parents, inf_hapi_data):
+def extract_parent_segments(parents, inf_hapi_data, min_segment_markers=800,
+                            return_debug_rows=False, pa_sites_break_segments=False):
     """
     Extract genomic segments where HAPI2 phased two distinct parents.
 
-    Identifies regions between P (phased parent) and other code sites where
-    HAPI2 determined distinct parental haplotypes. Segments must span at least
-    100 markers to be included.
+    Identifies regions between confirmed phase-boundary codes (P, PC) where
+    HAPI2 determined distinct parental haplotypes. Segments shorter than the
+    configured marker threshold are excluded from the returned segment list.
+
+    PA (phase-ambiguous) codes are HAPI sampling anchors placed at regular
+    intervals in low-information regions; they do not represent confirmed
+    crossovers. By default they are ignored for segment breaking. Use
+    pa_sites_break_segments=True to restore the original behaviour.
 
     Parameters
     ----------
@@ -288,19 +409,47 @@ def extract_parent_segments(parents, inf_hapi_data):
         Parent identifiers in format 'id1-id2'.
     inf_hapi_data : dict
         HAPI2 output dictionary containing 'codes', 'chr', 'chrstr', and other metadata.
+    min_segment_markers : int
+        Minimum marker span for a segment to be retained (default 800).
+    return_debug_rows : bool
+        If True, also return a list of all candidate spans with keep/drop metadata.
+    pa_sites_break_segments : bool
+        If True, treat PA codes as hard segment boundaries (original behaviour).
+        Default is False: PA sites extend the current segment.
 
     Returns
     -------
-    dict
+    dict or tuple
         Dictionary keyed by chromosome, with values as lists of [start, end] positions
         for each parent segment in marker coordinates (relative to chromosome start).
+        If return_debug_rows is True, also returns a list of all candidate spans
+        with keep/drop status and boundary metadata.
 
     Notes
     -----
-    P sites indicate phase boundaries. Segments occur between P sites or at
-    chromosome boundaries. Only segments with >= 100 markers are retained.
+    P/PC sites indicate confirmed phase boundaries.  PA sites are ambiguous
+    phase anchors.  Chromosome boundaries also terminate segments.
+    Only segments with >= min_segment_markers are retained.
     """
     the_parent_segments = defaultdict(list)
+    debug_rows = []
+
+    def _record_segment(chrom, first_marker, last_marker, start_reason, end_reason):
+        marker_count = last_marker - first_marker + 1
+        keep = marker_count >= int(min_segment_markers)
+        debug_rows.append(
+            {
+                "chromosome": str(chrom),
+                "start_marker": int(first_marker),
+                "end_marker": int(last_marker),
+                "marker_count": int(marker_count),
+                "kept": bool(keep),
+                "start_reason": str(start_reason),
+                "end_reason": str(end_reason),
+            }
+        )
+        if keep:
+            the_parent_segments[chrom].append([first_marker, last_marker])
 
     prev_chrom = None
     most_recent_P_site = None
@@ -313,26 +462,33 @@ def extract_parent_segments(parents, inf_hapi_data):
                 # marker indexes are relative to the first site on a given chromosome:
                 first_marker = most_recent_P_site - inf_hapi_data["chrstr"][prev_chrom]
                 last_marker = inf_hapi_data["chrstr"][cur_chrom]-1 - inf_hapi_data["chrstr"][prev_chrom]
-                if last_marker - first_marker >= 100:
-                    the_parent_segments[prev_chrom].append(
-                        [first_marker, last_marker]
-                    )
+                _record_segment(prev_chrom, first_marker, last_marker, "P-site", "chromosome-end")
             most_recent_P_site = None
             prev_chrom = cur_chrom
-        # (2) encountering a P site
-        if (
-                inf_codes is not None and
-                (inf_codes[0] == 'P' or inf_codes[0] == 'PC' or inf_codes[0] == 'PA')
-            ):
+        # (2) encountering a confirmed phase-boundary site (P or PC).
+        # PA sites are phase-ambiguous sampling anchors; by default they do not
+        # break the current segment.  Set pa_sites_break_segments=True to
+        # restore the original behaviour where PA also cuts a new segment.
+        is_confirmed_boundary = (
+            inf_codes is not None
+            and (inf_codes[0] == 'P' or inf_codes[0] == 'PC')
+        )
+        is_pa_boundary = (
+            inf_codes is not None
+            and inf_codes[0] == 'PA'
+        )
+        is_segment_break = is_confirmed_boundary or (is_pa_boundary and pa_sites_break_segments)
+        if is_segment_break:
             if most_recent_P_site is not None:
                 # marker indexes are relative to the first site on a given chromosome:
                 assert prev_chrom == cur_chrom
                 first_marker = most_recent_P_site - inf_hapi_data["chrstr"][cur_chrom]
                 last_marker = marker_idx-1 - inf_hapi_data["chrstr"][cur_chrom]
-                if last_marker - first_marker >= 100:
-                    the_parent_segments[prev_chrom].append(
-                        [first_marker, last_marker]
-                    )
+                _record_segment(prev_chrom, first_marker, last_marker, "P-site", f"{inf_codes[0]}-site")
+            most_recent_P_site = marker_idx
+        elif is_pa_boundary and most_recent_P_site is None:
+            # First marker on a chromosome may only have a PA code with no prior P/PC;
+            # treat it as the segment start in that case.
             most_recent_P_site = marker_idx
 
     # finished analyzing all chromosomes: put last segment into the_parent_segments
@@ -340,11 +496,10 @@ def extract_parent_segments(parents, inf_hapi_data):
     # marker indexes are relative to the first site on a given chromosome:
     first_marker = most_recent_P_site - inf_hapi_data["chrstr"][prev_chrom]
     last_marker = marker_idx-1 - inf_hapi_data["chrstr"][prev_chrom]
-    if last_marker - first_marker >= 100:
-        the_parent_segments[prev_chrom].append(
-            [first_marker, last_marker]
-        )
+    _record_segment(prev_chrom, first_marker, last_marker, "P-site", "final-marker")
 
+    if return_debug_rows:
+        return the_parent_segments, debug_rows
     return the_parent_segments
 
 
@@ -583,7 +738,9 @@ def collect_update_segment_overlaps(the_parent_segments, rels_to_analyze, parent
                 rel_pairs_side_counts[frozenset(pair)][1] += 1
 
             # add to overlap length:
-            length_cm = genetic_map[chrom][p_seg_end] - genetic_map[chrom][p_seg_start]
+            if _resolve_genetic_map_key(genetic_map, chrom) is None:
+                continue
+            length_cm = _get_genetic_cm(genetic_map, chrom, p_seg_end) - _get_genetic_cm(genetic_map, chrom, p_seg_start)
             for rel in parent_rels[0] | parent_rels[1]:
                 rel_overlap_length[rel] += length_cm
 
@@ -594,9 +751,10 @@ def determine_overlap_rel_parent_orient(rels_to_analyze, rel_overlap_length, rel
     """
     Determine parent orientation based on relative IBD co-inheritance patterns.
 
-    Identifies which relatives are informative for parent assignment by selecting
-    the relative with maximum overlap length and finding best secondary relative
-    based on co-inheritance scores.
+    Uses all informative relatives connected to the strongest overlap anchor,
+    rather than only one anchor plus one secondary relative. Relative-pair
+    evidence is treated as a graph where edges indicate whether two relatives
+    tend to co-inherit from the same parent or opposite parents.
 
     Parameters
     ----------
@@ -616,34 +774,64 @@ def determine_overlap_rel_parent_orient(rels_to_analyze, rel_overlap_length, rel
     Notes
     -----
     Selects maximum overlap relative as anchor (always orientation 0).
-    Secondary relative selected based on co-inheritance score:
-    score = max(same, opposite) - 3*min(same, opposite)
-    Skips pairs with min(same, opposite) > 2 (too ambiguous).
+    Builds a graph of relative-pair relationships using all informative pairs.
+    Skips strongly ambiguous pairs and propagates orientation across the anchor's
+    connected component. Disconnected relatives are left unresolved.
     """
     overlap_rel_parent_orient = dict()
     if len(rels_to_analyze) > 0 and len(rel_overlap_length) > 0:
         max_overlap_rel = max(rel_overlap_length, key=rel_overlap_length.get)
-        overlap_rel_parent_orient[max_overlap_rel] = 0
+        adjacency = defaultdict(list)
 
-        best_other_rel = None
-        best_other_score = None
-        best_other_val = None
-        for other_rel in rel_overlap_length.keys():
-            key = frozenset((max_overlap_rel, other_rel))
-            if key not in rel_pairs_side_counts:
+        for rel_pair, val in rel_pairs_side_counts.items():
+            rel_a, rel_b = tuple(rel_pair)
+            if rel_a not in rels_to_analyze or rel_b not in rels_to_analyze:
                 continue
 
-            val = rel_pairs_side_counts[key]
-            if min(val) > 2:
+            same_count, opposite_count = val
+            if same_count == 0 and opposite_count == 0:
+                continue
+            if min(val) > 2 and abs(same_count - opposite_count) <= 2:
                 continue  # too ambiguous
-            score = max(val) - 3 * min(val)
-            if best_other_score is None or score > best_other_score:
-                best_other_rel = other_rel
-                best_other_score = score
-                best_other_val = val
-        if best_other_rel is not None:
-            orient = 0 if best_other_val[0] > best_other_val[1] else 1
-            overlap_rel_parent_orient[best_other_rel] = orient
+
+            orient_delta = 0 if same_count >= opposite_count else 1
+            weight = abs(same_count - opposite_count)
+            if weight == 0:
+                continue
+
+            adjacency[rel_a].append((rel_b, orient_delta, weight, same_count, opposite_count))
+            adjacency[rel_b].append((rel_a, orient_delta, weight, same_count, opposite_count))
+
+        if max_overlap_rel in adjacency:
+            overlap_rel_parent_orient[max_overlap_rel] = 0
+            stack = [max_overlap_rel]
+            while stack:
+                rel_id = stack.pop()
+                rel_orient = overlap_rel_parent_orient[rel_id]
+                rel_edges = sorted(
+                    adjacency[rel_id],
+                    key=lambda edge: (edge[2], rel_overlap_length.get(edge[0], 0)),
+                    reverse=True,
+                )
+                for other_rel, orient_delta, weight, same_count, opposite_count in rel_edges:
+                    inferred_orient = rel_orient ^ orient_delta
+                    if other_rel not in overlap_rel_parent_orient:
+                        overlap_rel_parent_orient[other_rel] = inferred_orient
+                        stack.append(other_rel)
+                    elif overlap_rel_parent_orient[other_rel] != inferred_orient:
+                        logging.info(
+                            "  Conflicting relative orientation between %s and %s (same=%d opposite=%d); keeping existing assignment",
+                            rel_id,
+                            other_rel,
+                            same_count,
+                            opposite_count,
+                        )
+        else:
+            logging.info("  No informative relative-pair graph edges found for orientation inference")
+
+        unresolved = sorted(set(rels_to_analyze) - set(overlap_rel_parent_orient.keys()))
+        if unresolved:
+            logging.info("  Leaving %d relatives unresolved because they are disconnected or ambiguous: %s", len(unresolved), ", ".join(map(str, unresolved)))
 
     return overlap_rel_parent_orient
 
@@ -711,6 +899,7 @@ def link_segs_parents(the_parent_segments, overlap_rel_parent_orient, the_cos, s
                 continue
 
             parent_idx = None
+            conflicting_parent_evidence = False
             for rel_id in overlap_rel_this_seg:
                 # relative_parent_linkage is 0 if rel_id is IBD to the (locally labeled) father at this segment and 1 otherwise
                 # overlap_rel_parent_orient represents which relatives are linked to the same parents 0 or 1
@@ -718,8 +907,15 @@ def link_segs_parents(the_parent_segments, overlap_rel_parent_orient, the_cos, s
                 if parent_idx is None:
                     parent_idx = this_parent_idx
                 elif parent_idx != this_parent_idx:
-                    # suggests purple segment: skip
-                    continue
+                    # conflicting relative evidence: do not keep an arbitrary first assignment.
+                    conflicting_parent_evidence = True
+                    break
+
+            if conflicting_parent_evidence:
+                parent_segs_linkage[chrom].append(
+                    (p_seg_start, p_seg_end, None, co_probs)
+                )
+                continue
 
             parent_segs_linkage[chrom].append(
                 (p_seg_start, p_seg_end, parent_idx, co_probs)
@@ -728,8 +924,47 @@ def link_segs_parents(the_parent_segments, overlap_rel_parent_orient, the_cos, s
     return parent_segs_linkage
 
 
+def _alleles_to_input_result(alleles):
+    """Convert diploid alleles to input-style genotype token (e.g., AG, AA, --)."""
+    if alleles == (".", "."):
+        return "--"
+    non_missing = [a for a in alleles if a != "."]
+    if not non_missing:
+        return "--"
+    if len(non_missing) == 1:
+        return f"{non_missing[0]}{non_missing[0]}"
+    return f"{non_missing[0]}{non_missing[1]}"
+
+
+def _chrom_sort_key(chrom):
+    """Natural chromosome ordering for 1..22,X,Y and fallback lexical ordering."""
+    chrom_str = str(chrom)
+    if chrom_str.isdigit():
+        return (0, int(chrom_str))
+    if chrom_str == "X":
+        return (1, 23)
+    if chrom_str == "Y":
+        return (1, 24)
+    return (2, chrom_str)
+
+
+def write_parent_csv_outputs(parent_ids, parent_csv_records, out_dir):
+    """Write reconstructed parent calls to input-style CSV files."""
+    for parent_idx, parent_id in enumerate(parent_ids):
+        safe_parent_id = str(parent_id).replace(":", "-")
+        out_path = Path(out_dir) / f"{safe_parent_id}.reconstructed.csv"
+        calls = parent_csv_records[parent_idx]
+        sorted_rows = sorted(calls.items(), key=lambda item: (_chrom_sort_key(item[0][0]), item[0][1], item[0][2]))
+        with open(out_path, "w", encoding="utf-8", newline="") as fout:
+            writer = csv.writer(fout)
+            writer.writerow(["rsid", "chromosome", "position", "result"])
+            for (chrom, pos, snp_id), result in sorted_rows:
+                writer.writerow([snp_id, chrom, pos, result])
+        logging.info("Wrote reconstructed parent CSV: %s", out_path)
+
+
 def print_segment(inf_hapi_data, parents, snp_to_alleles, this_parent_orient,
-                  chrom, p_seg_start, p_seg_end, num_data_sites, vcf_out):
+                  chrom, p_seg_start, p_seg_end, num_data_sites, vcf_out, parent_csv_records=None):
     """
     Write reconstructed parent genotypes for a chromosomal segment to VCF.
 
@@ -755,8 +990,10 @@ def print_segment(inf_hapi_data, parents, snp_to_alleles, this_parent_orient,
         Segment end position (marker index relative to chromosome).
     num_data_sites : list of list
         Modified in-place: counts of [full, half, missing] sites for each parent.
-    vcf_out : pysam.VariantFile
-        Open VCF file for writing records.
+    vcf_out : pysam.VariantFile or text IO
+        Open VCF target used for writing records.
+    parent_csv_records : list[dict] or None
+        Optional per-parent call store used for input-style CSV export.
 
     Notes
     -----
@@ -765,6 +1002,13 @@ def print_segment(inf_hapi_data, parents, snp_to_alleles, this_parent_orient,
     this_parent_orient=0: parent 0 is father, parent 1 is mother
     this_parent_orient=1: parent 0 is mother, parent 1 is father (reversed)
     """
+    def _alleles_to_gt(alleles, ref_allele, alt_allele):
+        if alleles[0] == "." or alleles[1] == ".":
+            return ".|."
+        left = "0" if alleles[0] == ref_allele else "1" if alleles[0] == alt_allele else "."
+        right = "0" if alleles[1] == ref_allele else "1" if alleles[1] == alt_allele else "."
+        return f"{left}|{right}"
+
     inf_parent_haps = inf_hapi_data[parents]["parhaps"]
     inf_codes = inf_hapi_data[parents]["codes"]
     chr_start_marker_idx = inf_hapi_data["chrstr"][chrom]
@@ -781,38 +1025,61 @@ def print_segment(inf_hapi_data, parents, snp_to_alleles, this_parent_orient,
                 # pretty sure the above codes always come first -- confirm:
                 assert set(inf_codes[marker_idx]) & {'E', 'R', '?'} == set()
 
-        rec = vcf_out.new_record()
-        rec.chrom = chrom
-        rec.pos = inf_hapi_data["physpos"][marker_idx]
-        rec.id = inf_hapi_data["marker"][marker_idx]
-        rec.alleles = snp_to_alleles[rec.id]
+        chrom_pos = inf_hapi_data["physpos"][marker_idx]
+        snp_id = inf_hapi_data["marker"][marker_idx]
+        ref_allele, alt_allele = snp_to_alleles[snp_id]
+        output_parent_alleles = []
+
         # inf_parent_haps[0] are the alleles assigned to parent 0
         # inf_parent_haps[1] are the alleles assigned to parent 1
         # so inf_parent_haps[0^this_parent_orient] give the inferred paternal haplotypes
         # and index 1^this_parent_orient give the inferred maternal haplotypes
-        for parent_idx, sample in enumerate(rec.samples.values()):
-
-            parent_alleles = (inf_parent_haps[parent_idx^this_parent_orient][0][marker_idx],
-                    inf_parent_haps[parent_idx^this_parent_orient][1][marker_idx])
-            if set_missing or parent_alleles == ('0', '0'):  # fully missing
+        for parent_idx in range(2):
+            parent_alleles = (
+                inf_parent_haps[parent_idx ^ this_parent_orient][0][marker_idx],
+                inf_parent_haps[parent_idx ^ this_parent_orient][1][marker_idx],
+            )
+            if set_missing or parent_alleles == ("0", "0"):  # fully missing
                 num_data_sites[parent_idx][0] += 1  # site with 0 alleles reconstructed
-                # assigning .alleles here gives an error, so we use allele_indices
-                sample.allele_indices = (None, None)
-                sample.phased = True
+                output_parent_alleles.append((".", "."))
                 continue
-            if parent_alleles[0] == '0' or parent_alleles[1] == '0':  # half-missing
+            if parent_alleles[0] == "0" or parent_alleles[1] == "0":  # half-missing
                 num_data_sites[parent_idx][1] += 1  # site with 1 allele reconstructed
                 # make homozygous for the allele we do have:
-                if parent_alleles[0] != '0':
+                if parent_alleles[0] != "0":
                     parent_alleles = (parent_alleles[0], parent_alleles[0])
                 else:
                     parent_alleles = (parent_alleles[1], parent_alleles[1])
             else:
                 num_data_sites[parent_idx][2] += 1  # site with 2 alleles reconstructed
+            output_parent_alleles.append(parent_alleles)
 
-            sample.alleles = parent_alleles
-            sample.phased = True
-        vcf_out.write(rec)
+        if parent_csv_records is not None:
+            for parent_idx, parent_alleles in enumerate(output_parent_alleles):
+                parent_csv_records[parent_idx][(str(chrom), int(chrom_pos), str(snp_id))] = _alleles_to_input_result(parent_alleles)
+
+        if HAS_PYSAM:
+            rec = vcf_out.new_record()
+            rec.chrom = chrom
+            rec.pos = chrom_pos
+            rec.id = snp_id
+            rec.alleles = (ref_allele, alt_allele)
+            for parent_idx, sample in enumerate(rec.samples.values()):
+                parent_alleles = output_parent_alleles[parent_idx]
+                if parent_alleles == (".", "."):
+                    sample.allele_indices = (None, None)
+                else:
+                    sample.alleles = parent_alleles
+                sample.phased = True
+            vcf_out.write(rec)
+        else:
+            gt_values = [
+                _alleles_to_gt(parent_alleles, ref_allele, alt_allele)
+                for parent_alleles in output_parent_alleles
+            ]
+            vcf_out.write(
+                f"{chrom}\t{chrom_pos}\t{snp_id}\t{ref_allele}\t{alt_allele}\t.\tPASS\t.\tGT\t{gt_values[0]}\t{gt_values[1]}\n"
+            )
 
 
 def reconstruct(parents, inf_hapi_data, snp_to_alleles, ibd, genetic_map, ss_genetic_map,
@@ -856,15 +1123,31 @@ def reconstruct(parents, inf_hapi_data, snp_to_alleles, ibd, genetic_map, ss_gen
     Statistics distinguish fully reconstructed (both alleles) vs. half-reconstructed sites.
     """
     logging.info(f"Analayzing parents {parents}")
-
     # TODO: document assumption re: '-' in parent ids
-    father, mother = [int(p) for p in parents.split('-')]
+    father, mother = parents.split('-')
+
+    file_safe_parents = parents.replace(":", "-")
+    if ":" in father and ":" in mother:
+        father_family, father_id = father.split(":", 1)
+        mother_family, mother_id = mother.split(":", 1)
+        if father_family == mother_family:
+            co_file_parents = f"{father_family}-{father_id}-{mother_id}"
+        else:
+            co_file_parents = f"{father_family}-{father_id}-{mother_family}-{mother_id}"
+    else:
+        co_file_parents = file_safe_parents
+    father_keys = {father, father.split(':')[-1]}
+    mother_keys = {mother, mother.split(':')[-1]}
+    parent_keys = father_keys | mother_keys
 
     # because the parent haplotype assignments can be swapped, IBD to
     # either parent is what we're interested in
-    parent_ibd = ibd[(ibd.id1 == father) | (ibd.id1 == mother)]
+    id1_str = ibd["id1"].astype(str)
+    id2_str = ibd["id2"].astype(str)
+    parent_ibd = ibd[id1_str.isin(parent_keys)]
     # remove segments between the parents
-    parent_ibd = parent_ibd[(parent_ibd.id2 != father) & (parent_ibd.id2 != mother)]
+    parent_ibd_id2_str = parent_ibd["id2"].astype(str)
+    parent_ibd = parent_ibd[~parent_ibd_id2_str.isin(parent_keys)]
     # TODO: combine merge_ibd() with filter_overlap_ibd()
     parent_ibd = merge_ibd(parent_ibd, genetic_map)
     # filter segments that overlap both parents
@@ -880,10 +1163,55 @@ def reconstruct(parents, inf_hapi_data, snp_to_alleles, ibd, genetic_map, ss_gen
     )
     close_rels = close_rels[close_rels.length_cm > 600]
 
+    no_close_rels = len(close_rels.index) == 0
+    co_lod_threshold = 3.0
+    if no_close_rels and not args.use_default_no_relatives:
+        # Slightly more permissive threshold for sibling-only cases where no
+        # relatives provide IBD-based segment linkage.
+        co_lod_threshold = args.no_relatives_lod_threshold
+        logging.info(
+            "  No close relatives found; using lenient crossover-only LOD threshold %.1f",
+            co_lod_threshold,
+        )
+    elif no_close_rels:
+        logging.info(
+            "  No close relatives found; keeping default crossover-only LOD threshold %.1f",
+            co_lod_threshold,
+        )
+    if no_close_rels and args.sibling_only_mode:
+        logging.info(
+            "  Sibling-only mode enabled: allowing CO-only segment assignment without LOD gate"
+        )
+
     # returns a dictionary keyed on chromosome that stores a list of lists;
     # each inner list stores [first_marker, last_marker] for the corresponding
     # segment
-    the_parent_segments = extract_parent_segments(parents, inf_hapi_data)
+    if args.dump_parent_segments:
+        the_parent_segments, parent_segment_debug_rows = extract_parent_segments(
+            parents,
+            inf_hapi_data,
+            min_segment_markers=args.min_parent_segment_markers,
+            return_debug_rows=True,
+            pa_sites_break_segments=args.pa_sites_break_segments,
+        )
+        file_safe_parents = parents.replace(":", "-")
+        debug_path = Path(args.out) / f"{file_safe_parents}.parent_segments_debug.tsv"
+        debug_df = pd.DataFrame(parent_segment_debug_rows)
+        if not debug_df.empty:
+            for column_name in ("start_marker", "end_marker"):
+                global_marker = debug_df[column_name] + debug_df["chromosome"].map(lambda chrom: inf_hapi_data["chrstr"][str(chrom)])
+                debug_df[column_name.replace("marker", "bp")] = [
+                    int(inf_hapi_data["physpos"][idx]) for idx in global_marker
+                ]
+            debug_df.to_csv(debug_path, sep="\t", index=False)
+            logging.info("Wrote parent segment debug TSV: %s", debug_path)
+    else:
+        the_parent_segments = extract_parent_segments(
+            parents,
+            inf_hapi_data,
+            min_segment_markers=args.min_parent_segment_markers,
+            pa_sites_break_segments=args.pa_sites_break_segments,
+        )
 
     # find individuals that may be related to both parents. We term these
     # purple relatives: if we code one parent's relatives in red and the other
@@ -902,7 +1230,10 @@ def reconstruct(parents, inf_hapi_data, snp_to_alleles, ibd, genetic_map, ss_gen
     # read in the crossover locations, one dictionary per parent
     the_cos = [ defaultdict(list), defaultdict(list) ]
     for chrom in range(1, 23):
-        with open(f"{args.co_dir}/co-{parents}.{chrom}", "r") as fin:
+        co_filename = f"{args.co_dir}/co-{parents}.{chrom}"
+        if not Path(co_filename).exists():
+            co_filename = f"{args.co_dir}/co-{co_file_parents}.{chrom}"
+        with open(co_filename, "r") as fin:
             for line in fin:
                 if line[0] == "#":
                     continue
@@ -928,7 +1259,7 @@ def reconstruct(parents, inf_hapi_data, snp_to_alleles, ibd, genetic_map, ss_gen
 
     # if overall_co_probs > 0, crossovers suggest that parent_orient 0 segments have the dad assigned as parent 0
     # and mom as parent 1. The reverse is true if overall_co_probs < 0
-    overall_parent_orient = 0 if overall_co_probs > 0 else 1
+    overall_parent_orient = 0 if overall_co_probs >= 0 else 1
     # TODO: treat sexes as ambiguous if abs(overall_co_probs) < 3?
 
     # Assign segments to parents and quantify reconstruction
@@ -945,15 +1276,27 @@ def reconstruct(parents, inf_hapi_data, snp_to_alleles, ibd, genetic_map, ss_gen
     num_co_data_sites = [[0, 0, 0], [0, 0, 0]]
     num_co_segments = 0
 
-    # setup header
-    header = VariantHeader()
-    for chrom in chrom_names:
-        header.contigs.add(chrom)
-    header.formats.add("GT", 1, "String", "Genotype")
-    for parent_id in (father, mother):
-        header.add_sample(str(parent_id))
+    if HAS_PYSAM:
+        # setup header
+        header = VariantHeader()
+        for chrom in chrom_names:
+            header.contigs.add(chrom)
+        header.formats.add("GT", 1, "String", "Genotype")
+        for parent_id in (father, mother):
+            header.add_sample(str(parent_id))
+        vcf_handle = VariantFile(f"{args.out}/{file_safe_parents}.vcf", mode="w", header=header)
+    else:
+        vcf_handle = open(f"{args.out}/{file_safe_parents}.vcf", "w", encoding="utf-8")
+        vcf_handle.write("##fileformat=VCFv4.2\n")
+        for chrom in chrom_names:
+            vcf_handle.write(f"##contig=<ID={chrom}>\n")
+        vcf_handle.write('##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n')
+        vcf_handle.write(f"#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t{father}\t{mother}\n")
+
+    parent_csv_records = [dict(), dict()] if args.emit_input_format_csv else None
+
     # print VCF:
-    with VariantFile(f"{args.out}/{parents}.vcf", mode="w", header=header) as vcf_out:
+    with vcf_handle as vcf_out:
         for chrom, chr_parent_seg_link in parent_segs_linkage.items():
             for (p_seg_start, p_seg_end, parent_orient, co_probs) in chr_parent_seg_link:
                 co_prob_diff = co_probs[0] - co_probs[1]
@@ -973,15 +1316,53 @@ def reconstruct(parents, inf_hapi_data, snp_to_alleles, ibd, genetic_map, ss_gen
                     #if abs(co_prob_diff) >= 3:
                     #    num_map_segments += 1  # would place this segment using SS map only
 
-                    print_segment(inf_hapi_data, parents, snp_to_alleles, this_parent_orient, chrom, p_seg_start, p_seg_end, num_ibd_data_sites, vcf_out)
+                    print_segment(
+                        inf_hapi_data,
+                        parents,
+                        snp_to_alleles,
+                        this_parent_orient,
+                        chrom,
+                        p_seg_start,
+                        p_seg_end,
+                        num_ibd_data_sites,
+                        vcf_out,
+                        parent_csv_records=parent_csv_records,
+                    )
 
-                elif abs(co_prob_diff) >= 3:  # no IBD-linkage, but |LOD| >= 3
+                elif (no_close_rels and args.sibling_only_mode) or abs(co_prob_diff) >= co_lod_threshold:
                     # TODO: add option to only incorporate these segments if they cover a specified fraction of the genome
                     num_co_segments += 1
-                    logging.info(f"  Assigning segment {chrom} {p_seg_start}-{p_seg_end} to parents only using crossover LOD {abs(co_prob_diff):.1f}")
+                    if no_close_rels and args.sibling_only_mode:
+                        logging.info(
+                            f"  Assigning segment {chrom} {p_seg_start}-{p_seg_end} in sibling-only mode "
+                            f"(CO LOD {abs(co_prob_diff):.1f})"
+                        )
+                    else:
+                        logging.info(
+                            f"  Assigning segment {chrom} {p_seg_start}-{p_seg_end} to parents only using crossover LOD {abs(co_prob_diff):.1f}"
+                        )
 
-                    this_parent_orient = 0 if co_prob_diff > 0 else 1
-                    print_segment(inf_hapi_data, parents, snp_to_alleles, this_parent_orient, chrom, p_seg_start, p_seg_end, num_co_data_sites, vcf_out)
+                    if co_prob_diff > 0:
+                        this_parent_orient = 0
+                    elif co_prob_diff < 0:
+                        this_parent_orient = 1
+                    else:
+                        this_parent_orient = overall_parent_orient
+                    print_segment(
+                        inf_hapi_data,
+                        parents,
+                        snp_to_alleles,
+                        this_parent_orient,
+                        chrom,
+                        p_seg_start,
+                        p_seg_end,
+                        num_co_data_sites,
+                        vcf_out,
+                        parent_csv_records=parent_csv_records,
+                    )
+
+    if args.emit_input_format_csv:
+        write_parent_csv_outputs((father, mother), parent_csv_records, args.out)
 
     # quantify reconstruction
     num_ibd_reconstructed = [0, 0]
@@ -1056,6 +1437,7 @@ def main():
         for line in fin:
             fields = line.strip().split()
             genetic_map[fields[0]].append(float(fields[2]))
+    genetic_map = _normalize_map_keys(genetic_map)
 
     # get genetic positions
     logging.info("Loading sex-specific genetic maps")
@@ -1065,6 +1447,7 @@ def main():
             for line in fin:
                 fields = line.strip().split()
                 ss_genetic_map[sex_idx][fields[0]].append(float(fields[2]))
+        ss_genetic_map[sex_idx] = _normalize_map_keys(ss_genetic_map[sex_idx])
 
     logging.info("Loading IBD segments")
     ibd_by_chrom = []

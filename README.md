@@ -16,6 +16,9 @@ HAPI-RECAP reconstructs parental genomes from sibling genotypes when one or both
 
 This approach is particularly useful for families where parents are deceased or genotypes are unavailable, but where siblings and other genetic relatives have genotype data available.
 
+For a sibling-only practical runbook (3+ siblings, no informative relatives), see:
+`docs/3-sibling-workflow.md`.
+
 ## Requirements
 
 ### From HAPI2
@@ -93,6 +96,10 @@ python hapi-recap.py \
 | `-female_map` | Female-specific genetic map file (same format) |
 | `-co_dir` | Directory containing HAPI2 crossover files (e.g., `co-[siblings].1`, `co-[siblings].2`, etc.) |
 | `-out` | Output directory where VCF files will be written |
+| `-use_default_no_relatives` | Optional flag: keep default crossover-only threshold when no close relatives are found; without this flag, HAPI-RECAP is slightly more lenient in sibling-only runs |
+| `-no_relatives_lod_threshold` | Optional float (default `2.5`): crossover-only LOD threshold used when no close relatives are found |
+| `-sibling_only_mode` | Optional flag for 3-sibling-only runs: if no close relatives are found, allows CO-only segment assignment even when sex-LOD is uninformative |
+| `-emit_input_format_csv` | Optional flag: also write one reconstructed parent CSV per parent (`rsid,chromosome,position,result`) in the output directory |
 
 ## Output
 
